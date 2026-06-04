@@ -2,51 +2,57 @@
 # -*- coding: utf-8 -*-
 
 """
-dataset/collect_test_generations.py
+dataset/collect_train_generations.py
 
-Construct test-set generations for distribution-aware LLM routing.
-
-For each test query and each model, collect 6 observations:
-
-  A. Prompt-variation observations:
-     - Use 3 rewritten query variants.
-     - Use the default decoding strategy.
-
-  B. Decoding-strategy observations:
-     - Use the original query.
-     - Use 3 different decoding strategies.
+Purpose:
+  For GPQA, MATH-500, and DROP-800 training sets, call a 6-model OpenRouter pool
+  and collect repeated stochastic generations.
 
 Input:
-  data/gpqa/test_rewritten.jsonl
-  data/math-500/test_rewritten.jsonl
-  data/drop-800/test_rewritten.jsonl
+  data/gpqa/uncertainty_train_rewritten.jsonl
+  data/math-500/uncertainty_train_rewritten.jsonl
+  data/drop-800/uncertainty_train_rewritten.jsonl
+
+Each input record should contain:
+  - id
+  - dataset
+  - question
+  - context
+  - choices
+  - answer / answer_index / answer_text
+  - prompt_variants: list of rewritten questions
 
 Output:
-  data/<dataset>/test_generations.jsonl
-  data/<dataset>/test_generation_errors.jsonl
-  data/<dataset>/test_generation_summary.json
+  data/<dataset>/train_generations.jsonl
+  data/<dataset>/train_generation_errors.jsonl
+  data/<dataset>/train_generation_summary.json
 
 One output line = one model response for:
-  dataset × query × model × observation
+  dataset × query × prompt_variant × model × decoding_sample
+
+Default configuration:
+  - 6 models
+  - 5 prompt variants per query
+  - 5 stochastic decoding samples per prompt variant
+  - only uncertainty_train_rewritten.jsonl is used
 
 Resume:
-  Rerun the same command. Existing valid generation_key records are skipped.
+  Rerun the same command. The script loads existing train_generations.jsonl,
+  checks completed unique keys, and only continues missing generations.
 
 Usage:
   export OPENROUTER_API_KEY=xxx
 
-  python dataset/collect_test_generations.py \
+  python dataset/collect_train_generations.py \
     --data_dir data \
     --datasets gpqa math-500 drop-800 \
+    --num_prompt_variants 5 \
+    --num_decodes 5 \
     --max_workers 12
 
-Default model pool:
-  1. google/gemma-3-12b-it
-  2. mistralai/mistral-small-3.2-24b-instruct
-  3. qwen/qwen3-32b
-  4. meta-llama/llama-3.3-70b-instruct
-  5. google/gemini-2.5-flash-lite
-  6. deepseek/deepseek-chat-v3.1
+Notes:
+  - Do NOT hard-code API keys in this file.
+  - Increase --max_workers cautiously because OpenRouter/provider rate limits vary.
 """
 
 import argparse
@@ -54,11 +60,12 @@ import hashlib
 import json
 import os
 import random
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import requests
 from tqdm import tqdm
@@ -77,34 +84,8 @@ DEFAULT_MODEL_POOL = [
 ]
 
 
-DEFAULT_DECODING_STRATEGIES = [
-    {
-        "strategy_id": "low_temp",
-        "temperature": 0.2,
-        "top_p": 0.95,
-    },
-    {
-        "strategy_id": "standard",
-        "temperature": 0.7,
-        "top_p": 0.95,
-    },
-    {
-        "strategy_id": "high_temp",
-        "temperature": 1.0,
-        "top_p": 0.90,
-    },
-]
-
-
-DEFAULT_PROMPT_OBSERVATION_STRATEGY = {
-    "strategy_id": "standard",
-    "temperature": 0.7,
-    "top_p": 0.95,
-}
-
-
 # -----------------------------
-# IO
+# IO utilities
 # -----------------------------
 
 
@@ -133,18 +114,15 @@ def read_jsonl(path: Path) -> List[Dict[str, Any]]:
 def write_jsonl(records: Sequence[Dict[str, Any]], path: Path) -> None:
     ensure_dir(path.parent)
     tmp_path = path.with_suffix(path.suffix + ".tmp")
-
     with tmp_path.open("w", encoding="utf-8") as f:
         for record in records:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
-
     os.replace(tmp_path, path)
 
 
 def append_jsonl(record: Dict[str, Any], path: Path, lock: threading.Lock) -> None:
     ensure_dir(path.parent)
     line = json.dumps(record, ensure_ascii=False)
-
     with lock:
         with path.open("a", encoding="utf-8") as f:
             f.write(line + "\n")
@@ -154,10 +132,8 @@ def append_jsonl(record: Dict[str, Any], path: Path, lock: threading.Lock) -> No
 def write_json(obj: Dict[str, Any], path: Path) -> None:
     ensure_dir(path.parent)
     tmp_path = path.with_suffix(path.suffix + ".tmp")
-
     with tmp_path.open("w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False, indent=2)
-
     os.replace(tmp_path, path)
 
 
@@ -171,20 +147,18 @@ def clean_text(x: Any) -> Optional[str]:
 def compact_text(text: Optional[str], max_chars: int) -> Optional[str]:
     if text is None:
         return None
-
     text = str(text).strip()
     if len(text) <= max_chars:
         return text
-
     return text[:max_chars] + "\n...[TRUNCATED]"
 
 
 # -----------------------------
-# Resume / keys
+# Key / resume utilities
 # -----------------------------
 
 
-def stable_hash(text: str, n: int = 24) -> str:
+def stable_hash(text: str, n: int = 16) -> str:
     return hashlib.md5(text.encode("utf-8")).hexdigest()[:n]
 
 
@@ -192,34 +166,31 @@ def make_generation_key(
     dataset: str,
     query_id: str,
     model: str,
-    observation_type: str,
-    observation_id: str,
+    prompt_variant_id: int,
+    decode_id: int,
 ) -> str:
-    raw = f"{dataset}||{query_id}||{model}||{observation_type}||{observation_id}"
+    raw = f"{dataset}||{query_id}||{model}||{prompt_variant_id}||{decode_id}"
     return stable_hash(raw, n=24)
 
 
 def is_valid_generation_record(record: Dict[str, Any]) -> bool:
     if not record.get("generation_key"):
         return False
-    if not record.get("dataset"):
-        return False
-    if not record.get("query_id"):
-        return False
     if not record.get("model"):
         return False
-    if not record.get("observation_type"):
+    if record.get("prompt_variant_id") is None:
         return False
-    if not record.get("observation_id"):
+    if record.get("decode_id") is None:
         return False
-    if not clean_text(record.get("output_text")):
+    output_text = clean_text(record.get("output_text"))
+    if not output_text:
         return False
     return True
 
 
 def load_completed_generations(path: Path) -> Dict[str, Dict[str, Any]]:
     """
-    Load output JSONL as an append log.
+    Treat train_generations.jsonl as an append log.
     If duplicate generation_key exists, keep the latest valid record.
     """
     completed: Dict[str, Dict[str, Any]] = {}
@@ -240,7 +211,8 @@ def load_completed_generations(path: Path) -> Dict[str, Dict[str, Any]]:
             if not is_valid_generation_record(record):
                 continue
 
-            completed[str(record["generation_key"])] = record
+            key = str(record["generation_key"])
+            completed[key] = record
 
     return completed
 
@@ -248,6 +220,83 @@ def load_completed_generations(path: Path) -> Dict[str, Dict[str, Any]]:
 # -----------------------------
 # Prompt construction
 # -----------------------------
+
+
+def extract_prompt_variants(
+    record: Dict[str, Any],
+    num_prompt_variants: int,
+    include_original: bool,
+) -> List[Dict[str, Any]]:
+    """
+    Returns prompt variants as:
+      [{"prompt_variant_id": int, "question": str, "source": "rewrite/original"}]
+
+    Default:
+      only use rewritten variants, with variant ids from existing prompt_variants.
+
+    If include_original=True:
+      original question is inserted as prompt_variant_id=-1.
+    """
+    variants: List[Dict[str, Any]] = []
+
+    if include_original:
+        original_question = clean_text(record.get("question"))
+        if original_question:
+            variants.append(
+                {
+                    "prompt_variant_id": -1,
+                    "question": original_question,
+                    "source": "original",
+                }
+            )
+
+    raw_variants = record.get("prompt_variants", [])
+    if not isinstance(raw_variants, list):
+        raw_variants = []
+
+    for idx, item in enumerate(raw_variants):
+        if isinstance(item, dict):
+            question = clean_text(item.get("question"))
+            variant_id = item.get("variant_id", idx)
+        elif isinstance(item, str):
+            question = clean_text(item)
+            variant_id = idx
+        else:
+            continue
+
+        if question is None:
+            continue
+
+        try:
+            variant_id = int(variant_id)
+        except Exception:
+            variant_id = idx
+
+        variants.append(
+            {
+                "prompt_variant_id": variant_id,
+                "question": question,
+                "source": "rewrite",
+            }
+        )
+
+    # Deduplicate by question text while preserving order.
+    deduped: List[Dict[str, Any]] = []
+    seen = set()
+    for variant in variants:
+        key = variant["question"].strip().lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(variant)
+
+    if include_original:
+        # Original + num_prompt_variants rewrites.
+        max_total = num_prompt_variants + 1
+    else:
+        max_total = num_prompt_variants
+
+    return deduped[:max_total]
 
 
 def format_choices(choices: Any) -> str:
@@ -261,70 +310,23 @@ def format_choices(choices: Any) -> str:
     for i, choice in enumerate(choices):
         letter = chr(ord("A") + i)
         lines.append(f"{letter}. {choice}")
-
     return "\n".join(lines)
 
 
-def extract_rewritten_prompt_variants(
-    record: Dict[str, Any],
-    num_prompt_variants: int,
-) -> List[Dict[str, Any]]:
-    raw_variants = record.get("prompt_variants", [])
-    if not isinstance(raw_variants, list):
-        raw_variants = []
-
-    variants: List[Dict[str, Any]] = []
-    seen = set()
-
-    for idx, item in enumerate(raw_variants):
-        if isinstance(item, dict):
-            question = clean_text(item.get("question"))
-            variant_id = item.get("variant_id", idx)
-        elif isinstance(item, str):
-            question = clean_text(item)
-            variant_id = idx
-        else:
-            continue
-
-        if not question:
-            continue
-
-        key = question.strip().lower()
-        if key in seen:
-            continue
-        seen.add(key)
-
-        try:
-            variant_id = int(variant_id)
-        except Exception:
-            variant_id = idx
-
-        variants.append(
-            {
-                "prompt_variant_id": variant_id,
-                "question": question,
-            }
-        )
-
-        if len(variants) >= num_prompt_variants:
-            break
-
-    return variants
-
-
-def build_user_prompt(record: Dict[str, Any], question: str) -> str:
+def build_user_prompt(record: Dict[str, Any], variant_question: str) -> str:
     dataset = record.get("dataset")
     task_type = record.get("task_type")
     context = clean_text(record.get("context"))
     choices = record.get("choices")
 
     if dataset == "gpqa" or task_type == "multiple_choice":
+        choice_block = format_choices(choices)
         return (
             "Answer the following multiple-choice question.\n\n"
             "Question:\n"
-            f"{question}\n\n"
+            f"{variant_question}\n\n"
             "Choices:\n"
-            f"{format_choices(choices)}\n\n"
+            f"{choice_block}\n\n"
             "Return your final answer in this exact format at the end:\n"
             "Final Answer: <one option letter>\n"
         )
@@ -333,7 +335,7 @@ def build_user_prompt(record: Dict[str, Any], question: str) -> str:
         return (
             "Solve the following mathematics problem.\n\n"
             "Problem:\n"
-            f"{question}\n\n"
+            f"{variant_question}\n\n"
             "After any reasoning, put only the final result on the last line in this exact format:\n"
             "Final Answer: <answer>\n"
             "Do not write any prose after the final answer line.\n"
@@ -345,39 +347,41 @@ def build_user_prompt(record: Dict[str, Any], question: str) -> str:
             "Passage:\n"
             f"{compact_text(context, max_chars=12000)}\n\n"
             "Question:\n"
-            f"{question}\n\n"
+            f"{variant_question}\n\n"
             "Return your final answer in this exact format at the end:\n"
             "Final Answer: <short answer>\n"
         )
 
+    # Fallback.
     if context:
         return (
             "Answer the question using the provided context.\n\n"
             "Context:\n"
             f"{compact_text(context, max_chars=12000)}\n\n"
             "Question:\n"
-            f"{question}\n\n"
+            f"{variant_question}\n\n"
             "Return your final answer in this exact format at the end:\n"
             "Final Answer: <answer>\n"
         )
 
     return (
         "Answer the following question.\n\n"
-        f"{question}\n\n"
+        f"{variant_question}\n\n"
         "Return your final answer in this exact format at the end:\n"
         "Final Answer: <answer>\n"
     )
 
 
-def build_messages(record: Dict[str, Any], question: str) -> List[Dict[str, str]]:
+def build_messages(record: Dict[str, Any], variant_question: str) -> List[Dict[str, str]]:
     system = (
         "You are answering benchmark questions for an LLM routing experiment.\n"
         "Follow the user instructions exactly.\n"
-        "The final response must contain a clearly marked `Final Answer:` line.\n"
-        "Do not mention datasets, rewriting, routing, sampling, or evaluation."
+        "You may reason internally, but the final response must contain a clearly marked "
+        "`Final Answer:` line.\n"
+        "Do not mention that this is a paraphrase or dataset example."
     )
 
-    user = build_user_prompt(record, question)
+    user = build_user_prompt(record, variant_question)
 
     return [
         {"role": "system", "content": system},
@@ -402,179 +406,7 @@ def dataset_max_tokens(record: Dict[str, Any], default_max_tokens: int) -> int:
 
 
 # -----------------------------
-# Observation construction
-# -----------------------------
-
-
-def build_observations_for_record(
-    record: Dict[str, Any],
-    num_prompt_variants: int,
-    decoding_strategies: Sequence[Dict[str, Any]],
-    prompt_strategy: Dict[str, Any],
-) -> List[Dict[str, Any]]:
-    """
-    Each query has exactly 6 observations by default:
-      3 prompt observations:
-        rewritten prompts, same decoding config
-      3 decoding observations:
-        original prompt, different decoding configs
-    """
-    observations: List[Dict[str, Any]] = []
-
-    rewritten_variants = extract_rewritten_prompt_variants(
-        record=record,
-        num_prompt_variants=num_prompt_variants,
-    )
-
-    for local_idx, variant in enumerate(rewritten_variants):
-        observation_id = f"prompt_variant_{local_idx}"
-        observations.append(
-            {
-                "observation_type": "prompt_variation",
-                "observation_id": observation_id,
-                "question": variant["question"],
-                "prompt_variant_id": variant["prompt_variant_id"],
-                "prompt_variant_local_index": local_idx,
-                "decoding_strategy_id": prompt_strategy["strategy_id"],
-                "temperature": float(prompt_strategy["temperature"]),
-                "top_p": float(prompt_strategy["top_p"]),
-            }
-        )
-
-    original_question = clean_text(record.get("question"))
-    if not original_question:
-        raise ValueError(f"Record {record.get('id')} has empty original question")
-
-    for strategy in decoding_strategies:
-        strategy_id = str(strategy["strategy_id"])
-        observation_id = f"decoding_strategy_{strategy_id}"
-        observations.append(
-            {
-                "observation_type": "decoding_variation",
-                "observation_id": observation_id,
-                "question": original_question,
-                "prompt_variant_id": -1,
-                "prompt_variant_local_index": None,
-                "decoding_strategy_id": strategy_id,
-                "temperature": float(strategy["temperature"]),
-                "top_p": float(strategy["top_p"]),
-            }
-        )
-
-    return observations
-
-
-def build_task_list(
-    dataset_name: str,
-    records: Sequence[Dict[str, Any]],
-    models: Sequence[str],
-    num_prompt_variants: int,
-    decoding_strategies: Sequence[Dict[str, Any]],
-    prompt_strategy: Dict[str, Any],
-    completed: Dict[str, Dict[str, Any]],
-) -> Tuple[List[Dict[str, Any]], Dict[str, int], List[str]]:
-    tasks: List[Dict[str, Any]] = []
-    too_few_prompt_variants: List[str] = []
-
-    stats = {
-        "records": len(records),
-        "expected_total": 0,
-        "completed_existing": 0,
-        "missing_to_run": 0,
-        "prompt_observations_per_query": num_prompt_variants,
-        "decoding_observations_per_query": len(decoding_strategies),
-        "total_observations_per_query": num_prompt_variants + len(decoding_strategies),
-    }
-
-    for record in records:
-        query_id = str(record.get("id"))
-        dataset = str(record.get("dataset") or dataset_name)
-
-        rewritten_variants = extract_rewritten_prompt_variants(
-            record=record,
-            num_prompt_variants=num_prompt_variants,
-        )
-
-        if len(rewritten_variants) < num_prompt_variants:
-            too_few_prompt_variants.append(query_id)
-
-        observations = build_observations_for_record(
-            record=record,
-            num_prompt_variants=num_prompt_variants,
-            decoding_strategies=decoding_strategies,
-            prompt_strategy=prompt_strategy,
-        )
-
-        for model in models:
-            for obs in observations:
-                generation_key = make_generation_key(
-                    dataset=dataset,
-                    query_id=query_id,
-                    model=model,
-                    observation_type=obs["observation_type"],
-                    observation_id=obs["observation_id"],
-                )
-
-                stats["expected_total"] += 1
-
-                if generation_key in completed:
-                    stats["completed_existing"] += 1
-                    continue
-
-                tasks.append(
-                    {
-                        "generation_key": generation_key,
-                        "dataset": dataset,
-                        "query_id": query_id,
-                        "model": model,
-                        "record": record,
-                        "observation": obs,
-                    }
-                )
-
-    stats["missing_to_run"] = len(tasks)
-
-    return tasks, stats, too_few_prompt_variants
-
-
-def build_expected_key_order(
-    dataset_name: str,
-    records: Sequence[Dict[str, Any]],
-    models: Sequence[str],
-    num_prompt_variants: int,
-    decoding_strategies: Sequence[Dict[str, Any]],
-    prompt_strategy: Dict[str, Any],
-) -> List[str]:
-    keys: List[str] = []
-
-    for record in records:
-        query_id = str(record.get("id"))
-        dataset = str(record.get("dataset") or dataset_name)
-
-        observations = build_observations_for_record(
-            record=record,
-            num_prompt_variants=num_prompt_variants,
-            decoding_strategies=decoding_strategies,
-            prompt_strategy=prompt_strategy,
-        )
-
-        for model in models:
-            for obs in observations:
-                keys.append(
-                    make_generation_key(
-                        dataset=dataset,
-                        query_id=query_id,
-                        model=model,
-                        observation_type=obs["observation_type"],
-                        observation_id=obs["observation_id"],
-                    )
-                )
-
-    return keys
-
-
-# -----------------------------
-# OpenRouter
+# OpenRouter client
 # -----------------------------
 
 
@@ -588,6 +420,7 @@ def call_openrouter(
     timeout: int,
     referer: Optional[str],
     title: Optional[str],
+    extra_headers: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -598,6 +431,8 @@ def call_openrouter(
         headers["HTTP-Referer"] = referer
     if title:
         headers["X-Title"] = title
+    if extra_headers:
+        headers.update(extra_headers)
 
     body = {
         "model": model,
@@ -634,6 +469,7 @@ def parse_response_text(data: Dict[str, Any]) -> str:
     if isinstance(content, str):
         return content.strip()
 
+    # Some APIs may return structured content.
     if isinstance(content, list):
         parts = []
         for item in content:
@@ -667,8 +503,79 @@ def extract_finish_reason(data: Dict[str, Any]) -> Optional[str]:
 
 
 # -----------------------------
-# Generation worker
+# Task creation and execution
 # -----------------------------
+
+
+def build_task_list(
+    dataset_name: str,
+    records: Sequence[Dict[str, Any]],
+    models: Sequence[str],
+    num_prompt_variants: int,
+    num_decodes: int,
+    include_original: bool,
+    completed: Dict[str, Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    tasks: List[Dict[str, Any]] = []
+
+    stats = {
+        "records": len(records),
+        "expected_total": 0,
+        "completed_existing": 0,
+        "missing_to_run": 0,
+        "records_with_too_few_variants": 0,
+    }
+
+    for record in records:
+        query_id = str(record.get("id"))
+        dataset = str(record.get("dataset") or dataset_name)
+
+        variants = extract_prompt_variants(
+            record=record,
+            num_prompt_variants=num_prompt_variants,
+            include_original=include_original,
+        )
+
+        required_variant_count = num_prompt_variants + (1 if include_original else 0)
+        if len(variants) < required_variant_count:
+            stats["records_with_too_few_variants"] += 1
+
+        for variant in variants:
+            variant_id = int(variant["prompt_variant_id"])
+            variant_question = str(variant["question"])
+
+            for model in models:
+                for decode_id in range(num_decodes):
+                    key = make_generation_key(
+                        dataset=dataset,
+                        query_id=query_id,
+                        model=model,
+                        prompt_variant_id=variant_id,
+                        decode_id=decode_id,
+                    )
+
+                    stats["expected_total"] += 1
+
+                    if key in completed:
+                        stats["completed_existing"] += 1
+                        continue
+
+                    tasks.append(
+                        {
+                            "generation_key": key,
+                            "dataset": dataset,
+                            "query_id": query_id,
+                            "model": model,
+                            "prompt_variant_id": variant_id,
+                            "prompt_variant_source": variant["source"],
+                            "variant_question": variant_question,
+                            "decode_id": decode_id,
+                            "record": record,
+                        }
+                    )
+
+    stats["missing_to_run"] = len(tasks)
+    return tasks, stats
 
 
 def generation_task(
@@ -677,22 +584,25 @@ def generation_task(
     api_key: str,
 ) -> Dict[str, Any]:
     record = task["record"]
-    obs = task["observation"]
     model = task["model"]
+    variant_question = task["variant_question"]
 
-    messages = build_messages(record, question=obs["question"])
+    messages = build_messages(record, variant_question=variant_question)
     max_tokens = dataset_max_tokens(record, default_max_tokens=args.max_tokens)
 
     last_error: Optional[Exception] = None
 
     for attempt in range(args.max_retries):
         try:
+            # Slight temperature jitter across retries only, not across decode ids.
+            temperature = args.temperature
+
             data = call_openrouter(
                 messages=messages,
                 model=model,
                 api_key=api_key,
-                temperature=float(obs["temperature"]),
-                top_p=float(obs["top_p"]),
+                temperature=temperature,
+                top_p=args.top_p,
                 max_tokens=max_tokens,
                 timeout=args.timeout,
                 referer=args.openrouter_referer,
@@ -703,17 +613,17 @@ def generation_task(
             if not output_text:
                 raise ValueError("Empty output_text")
 
+            usage = extract_usage(data)
+
             out = {
                 "generation_key": task["generation_key"],
                 "dataset": task["dataset"],
                 "query_id": task["query_id"],
                 "model": model,
-                "observation_type": obs["observation_type"],
-                "observation_id": obs["observation_id"],
-                "prompt_variant_id": obs["prompt_variant_id"],
-                "prompt_variant_local_index": obs["prompt_variant_local_index"],
-                "decoding_strategy_id": obs["decoding_strategy_id"],
-                "input_question": obs["question"],
+                "prompt_variant_id": task["prompt_variant_id"],
+                "prompt_variant_source": task["prompt_variant_source"],
+                "decode_id": task["decode_id"],
+                "input_question": variant_question,
                 "original_question": record.get("question"),
                 "context": record.get("context"),
                 "choices": record.get("choices"),
@@ -723,20 +633,21 @@ def generation_task(
                 "category": record.get("category"),
                 "task_type": record.get("task_type"),
                 "score_type": record.get("score_type"),
+                "messages": messages if args.save_messages else None,
                 "output_text": output_text,
                 "finish_reason": extract_finish_reason(data),
                 "openrouter_response_id": data.get("id"),
-                "usage": extract_usage(data),
+                "usage": usage,
                 "request_config": {
-                    "temperature": float(obs["temperature"]),
-                    "top_p": float(obs["top_p"]),
+                    "temperature": args.temperature,
+                    "top_p": args.top_p,
                     "max_tokens": max_tokens,
                 },
                 "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             }
 
-            if args.save_messages:
-                out["messages"] = messages
+            if not args.save_messages:
+                out.pop("messages", None)
 
             return out
 
@@ -748,9 +659,8 @@ def generation_task(
     raise RuntimeError(
         f"Failed generation after {args.max_retries} retries. "
         f"key={task['generation_key']} model={model} "
-        f"query_id={task['query_id']} "
-        f"observation={obs['observation_type']}:{obs['observation_id']} "
-        f"last_error={last_error}"
+        f"query_id={task['query_id']} variant={task['prompt_variant_id']} "
+        f"decode={task['decode_id']} last_error={last_error}"
     )
 
 
@@ -764,6 +674,9 @@ def compact_output_file(
     completed: Dict[str, Dict[str, Any]],
     expected_keys_order: Sequence[str],
 ) -> None:
+    """
+    Rewrites output JSONL in deterministic expected-key order, dropping duplicates.
+    """
     ordered_records: List[Dict[str, Any]] = []
     missing = 0
 
@@ -778,97 +691,6 @@ def compact_output_file(
 
     if missing:
         print(f"Compaction warning: {missing} expected keys still missing in {output_path}")
-
-
-def write_dataset_summary(
-    summary_path: Path,
-    dataset_name: str,
-    records: Sequence[Dict[str, Any]],
-    args: argparse.Namespace,
-    completed: Dict[str, Dict[str, Any]],
-    expected_total: int,
-    failed_count: int,
-    too_few_prompt_variants: Sequence[str],
-) -> None:
-    by_model: Dict[str, int] = {m: 0 for m in args.models}
-    by_observation_type: Dict[str, int] = {}
-    by_dataset: Dict[str, int] = {}
-
-    total_prompt_tokens = 0
-    total_completion_tokens = 0
-    total_tokens = 0
-    total_cost = 0.0
-    cost_seen = False
-
-    for record in completed.values():
-        model = str(record.get("model"))
-        by_model[model] = by_model.get(model, 0) + 1
-
-        obs_type = str(record.get("observation_type"))
-        by_observation_type[obs_type] = by_observation_type.get(obs_type, 0) + 1
-
-        dataset = str(record.get("dataset"))
-        by_dataset[dataset] = by_dataset.get(dataset, 0) + 1
-
-        usage = record.get("usage") or {}
-        if isinstance(usage, dict):
-            prompt_tokens = usage.get("prompt_tokens")
-            completion_tokens = usage.get("completion_tokens")
-            total = usage.get("total_tokens")
-            cost = usage.get("cost")
-
-            if isinstance(prompt_tokens, int):
-                total_prompt_tokens += prompt_tokens
-            if isinstance(completion_tokens, int):
-                total_completion_tokens += completion_tokens
-            if isinstance(total, int):
-                total_tokens += total
-            if isinstance(cost, (int, float)):
-                total_cost += float(cost)
-                cost_seen = True
-
-    summary = {
-        "dataset": dataset_name,
-        "num_records": len(records),
-        "models": list(args.models),
-        "num_models": len(args.models),
-        "observations_per_query": {
-            "prompt_variation": args.num_prompt_variants,
-            "decoding_variation": 3,
-            "total": args.num_prompt_variants + 3,
-        },
-        "decoding_strategies": DEFAULT_DECODING_STRATEGIES,
-        "prompt_observation_strategy": DEFAULT_PROMPT_OBSERVATION_STRATEGY,
-        "expected_total_generations": expected_total,
-        "completed_generations": len(completed),
-        "missing_generations": max(expected_total - len(completed), 0),
-        "failed_count_this_run": failed_count,
-        "too_few_prompt_variants": list(too_few_prompt_variants),
-        "by_model_completed": by_model,
-        "by_observation_type_completed": by_observation_type,
-        "by_dataset_completed": by_dataset,
-        "usage": {
-            "prompt_tokens": total_prompt_tokens,
-            "completion_tokens": total_completion_tokens,
-            "total_tokens": total_tokens,
-            "cost": total_cost if cost_seen else None,
-        },
-        "request_config": {
-            "max_tokens": args.max_tokens,
-            "max_workers": args.max_workers,
-            "max_retries": args.max_retries,
-            "timeout": args.timeout,
-        },
-        "files": {
-            "input": args.input_filename,
-            "output": args.output_filename,
-            "errors": args.error_filename,
-            "summary": args.summary_filename,
-        },
-        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-    }
-
-    write_json(summary, summary_path)
 
 
 def process_dataset(dataset_name: str, args: argparse.Namespace, api_key: str) -> None:
@@ -894,13 +716,13 @@ def process_dataset(dataset_name: str, args: argparse.Namespace, api_key: str) -
 
     completed = load_completed_generations(output_path)
 
-    tasks, stats, too_few_prompt_variants = build_task_list(
+    tasks, stats = build_task_list(
         dataset_name=dataset_name,
         records=records,
         models=args.models,
         num_prompt_variants=args.num_prompt_variants,
-        decoding_strategies=DEFAULT_DECODING_STRATEGIES,
-        prompt_strategy=DEFAULT_PROMPT_OBSERVATION_STRATEGY,
+        num_decodes=args.num_decodes,
+        include_original=args.include_original,
         completed=completed,
     )
 
@@ -908,23 +730,14 @@ def process_dataset(dataset_name: str, args: argparse.Namespace, api_key: str) -
     print(f"Input: {input_path}")
     print(f"Output: {output_path}")
     print(f"Records: {stats['records']}")
-    print(f"Models: {len(args.models)}")
-    print(f"Prompt observations/query: {stats['prompt_observations_per_query']}")
-    print(f"Decoding observations/query: {stats['decoding_observations_per_query']}")
-    print(f"Total observations/query: {stats['total_observations_per_query']}")
     print(f"Expected generations: {stats['expected_total']}")
     print(f"Completed existing: {stats['completed_existing']}")
     print(f"Missing to run: {stats['missing_to_run']}")
-    print(f"Too few prompt variants: {len(too_few_prompt_variants)}")
+    print(f"Records with too few prompt variants: {stats['records_with_too_few_variants']}")
+    print(f"Models: {len(args.models)}")
+    print(f"Prompt variants per query: {args.num_prompt_variants}")
+    print(f"Decodes per prompt variant: {args.num_decodes}")
     print(f"Max workers: {args.max_workers}")
-
-    if too_few_prompt_variants:
-        print(f"First too-few-variant ids: {too_few_prompt_variants[:10]}")
-        if args.fail_on_too_few_prompt_variants:
-            raise RuntimeError(
-                f"{dataset_name}: {len(too_few_prompt_variants)} records have fewer than "
-                f"{args.num_prompt_variants} prompt variants."
-            )
 
     if not tasks:
         expected_keys_order = build_expected_key_order(
@@ -932,8 +745,8 @@ def process_dataset(dataset_name: str, args: argparse.Namespace, api_key: str) -
             records=records,
             models=args.models,
             num_prompt_variants=args.num_prompt_variants,
-            decoding_strategies=DEFAULT_DECODING_STRATEGIES,
-            prompt_strategy=DEFAULT_PROMPT_OBSERVATION_STRATEGY,
+            num_decodes=args.num_decodes,
+            include_original=args.include_original,
         )
         compact_output_file(output_path, completed, expected_keys_order)
         write_dataset_summary(
@@ -942,11 +755,9 @@ def process_dataset(dataset_name: str, args: argparse.Namespace, api_key: str) -
             records=records,
             args=args,
             completed=completed,
-            expected_total=len(expected_keys_order),
+            expected_total=stats["expected_total"],
             failed_count=0,
-            too_few_prompt_variants=too_few_prompt_variants,
         )
-        print(f"Dataset {dataset_name} already complete.")
         return
 
     output_lock = threading.Lock()
@@ -982,8 +793,8 @@ def process_dataset(dataset_name: str, args: argparse.Namespace, api_key: str) -
                         "dataset": task["dataset"],
                         "query_id": task["query_id"],
                         "model": task["model"],
-                        "observation_type": task["observation"]["observation_type"],
-                        "observation_id": task["observation"]["observation_id"],
+                        "prompt_variant_id": task["prompt_variant_id"],
+                        "decode_id": task["decode_id"],
                         "error": str(exc),
                         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
                     }
@@ -999,6 +810,7 @@ def process_dataset(dataset_name: str, args: argparse.Namespace, api_key: str) -
         )
         raise
 
+    # Reload output file to be robust against any process-local inconsistency.
     completed = load_completed_generations(output_path)
 
     expected_keys_order = build_expected_key_order(
@@ -1006,8 +818,8 @@ def process_dataset(dataset_name: str, args: argparse.Namespace, api_key: str) -
         records=records,
         models=args.models,
         num_prompt_variants=args.num_prompt_variants,
-        decoding_strategies=DEFAULT_DECODING_STRATEGIES,
-        prompt_strategy=DEFAULT_PROMPT_OBSERVATION_STRATEGY,
+        num_decodes=args.num_decodes,
+        include_original=args.include_original,
     )
 
     missing_after = [key for key in expected_keys_order if key not in completed]
@@ -1022,7 +834,6 @@ def process_dataset(dataset_name: str, args: argparse.Namespace, api_key: str) -
         completed=completed,
         expected_total=len(expected_keys_order),
         failed_count=failed_count,
-        too_few_prompt_variants=too_few_prompt_variants,
     )
 
     if failed_count:
@@ -1034,6 +845,123 @@ def process_dataset(dataset_name: str, args: argparse.Namespace, api_key: str) -
         print("Rerun the same command to continue.")
     else:
         print(f"Dataset {dataset_name} complete.")
+
+
+def build_expected_key_order(
+    dataset_name: str,
+    records: Sequence[Dict[str, Any]],
+    models: Sequence[str],
+    num_prompt_variants: int,
+    num_decodes: int,
+    include_original: bool,
+) -> List[str]:
+    keys: List[str] = []
+
+    for record in records:
+        query_id = str(record.get("id"))
+        dataset = str(record.get("dataset") or dataset_name)
+
+        variants = extract_prompt_variants(
+            record=record,
+            num_prompt_variants=num_prompt_variants,
+            include_original=include_original,
+        )
+
+        for variant in variants:
+            variant_id = int(variant["prompt_variant_id"])
+
+            for model in models:
+                for decode_id in range(num_decodes):
+                    keys.append(
+                        make_generation_key(
+                            dataset=dataset,
+                            query_id=query_id,
+                            model=model,
+                            prompt_variant_id=variant_id,
+                            decode_id=decode_id,
+                        )
+                    )
+
+    return keys
+
+
+def write_dataset_summary(
+    summary_path: Path,
+    dataset_name: str,
+    records: Sequence[Dict[str, Any]],
+    args: argparse.Namespace,
+    completed: Dict[str, Dict[str, Any]],
+    expected_total: int,
+    failed_count: int,
+) -> None:
+    by_model: Dict[str, int] = {m: 0 for m in args.models}
+    by_dataset: Dict[str, int] = {}
+    total_prompt_tokens = 0
+    total_completion_tokens = 0
+    total_tokens = 0
+    total_cost = 0.0
+    cost_seen = False
+
+    for record in completed.values():
+        model = str(record.get("model"))
+        by_model[model] = by_model.get(model, 0) + 1
+
+        dataset = str(record.get("dataset"))
+        by_dataset[dataset] = by_dataset.get(dataset, 0) + 1
+
+        usage = record.get("usage") or {}
+        if isinstance(usage, dict):
+            prompt_tokens = usage.get("prompt_tokens")
+            completion_tokens = usage.get("completion_tokens")
+            tokens = usage.get("total_tokens")
+            cost = usage.get("cost")
+
+            if isinstance(prompt_tokens, int):
+                total_prompt_tokens += prompt_tokens
+            if isinstance(completion_tokens, int):
+                total_completion_tokens += completion_tokens
+            if isinstance(tokens, int):
+                total_tokens += tokens
+            if isinstance(cost, (int, float)):
+                total_cost += float(cost)
+                cost_seen = True
+
+    summary = {
+        "dataset": dataset_name,
+        "num_records": len(records),
+        "models": list(args.models),
+        "num_models": len(args.models),
+        "num_prompt_variants": args.num_prompt_variants,
+        "include_original": args.include_original,
+        "num_decodes": args.num_decodes,
+        "expected_total_generations": expected_total,
+        "completed_generations": len(completed),
+        "missing_generations": max(expected_total - len(completed), 0),
+        "failed_count_this_run": failed_count,
+        "by_model_completed": by_model,
+        "by_dataset_completed": by_dataset,
+        "usage": {
+            "prompt_tokens": total_prompt_tokens,
+            "completion_tokens": total_completion_tokens,
+            "total_tokens": total_tokens,
+            "cost": total_cost if cost_seen else None,
+        },
+        "request_config": {
+            "temperature": args.temperature,
+            "top_p": args.top_p,
+            "max_tokens": args.max_tokens,
+            "max_workers": args.max_workers,
+        },
+        "files": {
+            "input": args.input_filename,
+            "output": args.output_filename,
+            "errors": args.error_filename,
+            "summary": args.summary_filename,
+        },
+        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+    write_json(summary, summary_path)
 
 
 # -----------------------------
@@ -1062,31 +990,44 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--input_filename",
         type=str,
-        default="test_rewritten.jsonl",
+        default="uncertainty_train_rewritten.jsonl",
     )
     parser.add_argument(
         "--output_filename",
         type=str,
-        default="test_generations.jsonl",
+        default="train_generations.jsonl",
     )
     parser.add_argument(
         "--error_filename",
         type=str,
-        default="test_generation_errors.jsonl",
+        default="train_generation_errors.jsonl",
     )
     parser.add_argument(
         "--summary_filename",
         type=str,
-        default="test_generation_summary.json",
+        default="train_generation_summary.json",
     )
 
     parser.add_argument(
         "--num_prompt_variants",
         type=int,
-        default=3,
-        help="Number of rewritten prompt variants used for prompt-side test observations.",
+        default=5,
+        help="Number of rewritten prompt variants per query to use.",
+    )
+    parser.add_argument(
+        "--include_original",
+        action="store_true",
+        help="Also sample the original question as prompt_variant_id=-1.",
+    )
+    parser.add_argument(
+        "--num_decodes",
+        type=int,
+        default=5,
+        help="Number of stochastic decoding samples per query/model/prompt variant.",
     )
 
+    parser.add_argument("--temperature", type=float, default=0.7)
+    parser.add_argument("--top_p", type=float, default=0.95)
     parser.add_argument("--max_tokens", type=int, default=3072)
     parser.add_argument("--timeout", type=int, default=180)
     parser.add_argument("--max_retries", type=int, default=5)
@@ -1133,11 +1074,6 @@ def parse_args() -> argparse.Namespace:
         help="Stop immediately on the first failed request.",
     )
     parser.add_argument(
-        "--fail_on_too_few_prompt_variants",
-        action="store_true",
-        help="Fail if a record has fewer than --num_prompt_variants rewritten prompts.",
-    )
-    parser.add_argument(
         "--save_messages",
         action="store_true",
         help="Save full chat messages in each generation record.",
@@ -1162,21 +1098,16 @@ def main() -> None:
 
     if args.num_prompt_variants <= 0:
         raise ValueError("--num_prompt_variants must be positive.")
-
+    if args.num_decodes <= 0:
+        raise ValueError("--num_decodes must be positive.")
     if args.max_workers <= 0:
         raise ValueError("--max_workers must be positive.")
-
     if not args.models:
         raise ValueError("--models must contain at least one model.")
 
     print("Model pool:")
     for model in args.models:
         print(f"  - {model}")
-
-    print("\nTest observation design:")
-    print(f"  - prompt variation observations/query: {args.num_prompt_variants}")
-    print("  - decoding variation observations/query: 3")
-    print(f"  - total observations/query/model: {args.num_prompt_variants + 3}")
 
     for dataset_name in args.datasets:
         process_dataset(dataset_name, args=args, api_key=args.api_key)
