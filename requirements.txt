@@ -10,3 +10,5 @@ seaborn
 sentence-transformers
 sympy
 jupyter
+datasets
+huggingface-hub

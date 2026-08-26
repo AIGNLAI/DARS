@@ -1,0 +1,22 @@
+# Downloaded benchmark and source data
+data/
+
+# Experiment outputs
+outputs/
+analysis_outputs*/
+
+# Local models and caches
+models/
+.cache/
+
+# Python and notebook artifacts
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Environments and editor files
+.venv/
+.env
+.DS_Store
+.idea/
+.vscode/

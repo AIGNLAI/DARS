@@ -1,22 +1,24 @@
 #!/usr/bin/env python3
-"""MIRT-style interpretable router for distribution-aware LLM routing.
+"""MIRT router for single-shot and DARS supervision.
 
-This adapts the LAMDA-ORBIT MIRT reference into the local scored-generation
-format. It learns query ability vectors and per-model discrimination/difficulty
-parameters, then routes by predicted score minus cost and risk penalties.
+The implementation follows the DARS paper appendix. It learns query ability
+vectors and model-specific discrimination and difficulty parameters, then
+routes by predicted score minus cost and risk penalties.
 """
 
 from __future__ import annotations
 
 import argparse
+from collections.abc import Sequence
 from dataclasses import dataclass
+from itertools import pairwise
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn as nn
+from torch import nn
 
 try:
     from .mlp import (
@@ -24,6 +26,7 @@ try:
         DATASET_RISK_BETA,
         DATASETS,
         DEFAULT_LOCAL_ENCODER,
+        DEFAULT_RISK_BETA,
         QueryEncoder,
         build_quality_table,
         build_query_text_table,
@@ -43,6 +46,7 @@ except ImportError:
         DATASET_RISK_BETA,
         DATASETS,
         DEFAULT_LOCAL_ENCODER,
+        DEFAULT_RISK_BETA,
         QueryEncoder,
         build_quality_table,
         build_query_text_table,
@@ -57,11 +61,7 @@ except ImportError:
         to_dense_array,
     )
 
-DATASET_RISK_BETA = {
-    "gpqa": 0.2,
-    "math-500": 0.05,
-    "drop-800": 0.15,
-}
+
 @dataclass(frozen=True)
 class MIRTConfig:
     cost_weight: float = 0.05
@@ -94,7 +94,7 @@ class MIRTHead(nn.Module):
         super().__init__()
         layers: list[nn.Module] = []
         dims = [input_dim, *[int(size) for size in hidden_layers]]
-        for in_dim, out_dim in zip(dims, dims[1:]):
+        for in_dim, out_dim in pairwise(dims):
             layers.append(nn.Linear(in_dim, out_dim))
             layers.append(nn.ReLU())
         layers.append(nn.Linear(dims[-1], latent_dim))
@@ -111,7 +111,9 @@ class MIRTHead(nn.Module):
 
 
 class MIRTRouter:
-    def __init__(self, model: "MIRTNet", config: MIRTConfig, stats: dict[str, Any]) -> None:
+    def __init__(
+        self, model: MIRTNet, config: MIRTConfig, stats: dict[str, Any]
+    ) -> None:
         self.model = model
         self.config = config
         self.stats = stats
@@ -130,7 +132,9 @@ class MIRTNet(nn.Module):
         self.cost_head = MIRTHead(input_dim, num_models, latent_dim, hidden_layers)
         self.std_head = MIRTHead(input_dim, num_models, latent_dim, hidden_layers)
 
-    def forward(self, query_features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(
+        self, query_features: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         score_logits = self.score_head.logits(query_features)
         cost = self.cost_head(query_features)
         std = self.std_head(query_features)
@@ -153,7 +157,7 @@ def seed_training(seed: int) -> None:
 def get_risk_beta(dataset: str, config: MIRTConfig) -> float:
     if config.risk_beta is not None:
         return float(config.risk_beta)
-    return float(DATASET_RISK_BETA.get(dataset, 0.10))
+    return float(DATASET_RISK_BETA.get(dataset, DEFAULT_RISK_BETA))
 
 
 def router_targets(
@@ -161,7 +165,9 @@ def router_targets(
     query_meta: pd.DataFrame,
     models: Sequence[str],
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    targets = pivot_targets(qtarget, query_meta, ["mean_score", "mean_cost", "score_std"], models)
+    targets = pivot_targets(
+        qtarget, query_meta, ["mean_score", "mean_cost", "score_std"], models
+    )
     return (
         np.clip(targets["mean_score"], 0.0, 1.0).astype(np.float32),
         np.clip(targets["mean_cost"], 0.0, 1.0).astype(np.float32),
@@ -183,7 +189,11 @@ def train_mirt_model(
     score = np.asarray(target_score, dtype=np.float32)
     cost = np.asarray(target_cost, dtype=np.float32)
     std = np.asarray(target_std, dtype=np.float32)
-    if score.shape != cost.shape or score.shape != std.shape or score.shape[0] != features.shape[0]:
+    if (
+        score.shape != cost.shape
+        or score.shape != std.shape
+        or score.shape[0] != features.shape[0]
+    ):
         raise ValueError("MIRT targets must align with training features.")
 
     model = MIRTNet(
@@ -306,7 +316,9 @@ def predict_mirt(
                     "pred_cost": float(pred_cost[row_index, model_index]),
                     "pred_score_std": float(pred_std[row_index, model_index]),
                     "pred_utility": float(pred_utility[row_index, model_index]),
-                    "pred_risk_utility": float(pred_risk_utility[row_index, model_index]),
+                    "pred_risk_utility": float(
+                        pred_risk_utility[row_index, model_index]
+                    ),
                     "risk_beta": float(risk_beta),
                     "selected": bool(model_index == selected[row_index]),
                 }
@@ -412,7 +424,9 @@ def run_experiment(
             target = train_distribution_qtable[
                 train_distribution_qtable["dataset"] == dataset
             ].copy()
-            target_score, target_cost, target_std = router_targets(target, ds_train_meta, models)
+            target_score, target_cost, target_std = router_targets(
+                target, ds_train_meta, models
+            )
             router = train_mirt_model(
                 ds_x_train, target_score, target_cost, target_std, config.seed, config
             )
@@ -425,10 +439,18 @@ def run_experiment(
                 ds_test_meta,
                 config,
             )
-            summary, detail = evaluate_predictions(predictions, rewrite_qtable, decoding_qtable)
+            summary, detail = evaluate_predictions(
+                predictions, rewrite_qtable, decoding_qtable
+            )
             summaries.append(
                 add_summary_metadata(
-                    summary, dataset, "distribution", None, risk_beta, router.stats, config
+                    summary,
+                    dataset,
+                    "distribution",
+                    None,
+                    risk_beta,
+                    router.stats,
+                    config,
                 )
             )
             prediction_frames.append(predictions)
@@ -446,7 +468,12 @@ def run_experiment(
                     single_qtable, ds_train_meta, models
                 )
                 router = train_mirt_model(
-                    ds_x_train, target_score, target_cost, target_std, config.seed + run, config
+                    ds_x_train,
+                    target_score,
+                    target_cost,
+                    target_std,
+                    config.seed + run,
+                    config,
                 )
                 predictions, model_predictions = predict_mirt(
                     router,
@@ -457,7 +484,9 @@ def run_experiment(
                     ds_test_meta,
                     config,
                 )
-                summary, detail = evaluate_predictions(predictions, rewrite_qtable, decoding_qtable)
+                summary, detail = evaluate_predictions(
+                    predictions, rewrite_qtable, decoding_qtable
+                )
                 summaries.append(
                     add_summary_metadata(
                         summary, dataset, "single-point", run, 0.0, router.stats, config
@@ -468,7 +497,9 @@ def run_experiment(
                 evaluation_frames.append(detail)
 
     if not summaries:
-        raise ValueError("No MIRT routers were trained. Check dataset names and input files.")
+        raise ValueError(
+            "No MIRT routers were trained. Check dataset names and input files."
+        )
 
     output_dir.mkdir(parents=True, exist_ok=True)
     summary_df = pd.DataFrame(summaries)
@@ -477,7 +508,9 @@ def run_experiment(
         baselines, on=["dataset", "dataset_display"], how="left", validate="many_to_one"
     )
     summary_df.to_csv(output_dir / "mirt_summary.csv", index=False)
-    summarize_runs(summary_df).to_csv(output_dir / "mirt_summary_by_mode.csv", index=False)
+    summarize_runs(summary_df).to_csv(
+        output_dir / "mirt_summary_by_mode.csv", index=False
+    )
     baselines.to_csv(output_dir / "mirt_test_baselines.csv", index=False)
     pd.concat(prediction_frames, ignore_index=True).to_csv(
         output_dir / "mirt_predictions.csv", index=False
@@ -494,7 +527,9 @@ def run_experiment(
 def parse_hidden_layers(value: str) -> tuple[int, ...]:
     layers = tuple(int(part.strip()) for part in value.split(",") if part.strip())
     if not layers or any(layer <= 0 for layer in layers):
-        raise argparse.ArgumentTypeError("hidden layers must be positive comma-separated integers")
+        raise argparse.ArgumentTypeError(
+            "hidden layers must be positive comma-separated integers"
+        )
     return layers
 
 
@@ -502,18 +537,29 @@ def parse_args() -> argparse.Namespace:
     project_dir = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", type=Path, default=project_dir / "data")
-    parser.add_argument("--output-dir", type=Path, default=project_dir / "analysis_outputs_mirt")
+    parser.add_argument(
+        "--output-dir", type=Path, default=project_dir / "outputs" / "mirt"
+    )
     parser.add_argument("--datasets", nargs="+", default=list(DATASETS))
-    parser.add_argument("--mode", choices=("single-point", "distribution", "both"), default="both")
+    parser.add_argument(
+        "--mode", choices=("single-point", "distribution", "both"), default="both"
+    )
     parser.add_argument(
         "--feature-backend",
         choices=("auto", "tfidf", "sentence-transformer"),
         default="auto",
     )
-    parser.add_argument("--local-encoder-path", type=Path, default=DEFAULT_LOCAL_ENCODER)
+    parser.add_argument(
+        "--local-encoder-path", type=Path, default=DEFAULT_LOCAL_ENCODER
+    )
     parser.add_argument("--single-point-runs", type=int, default=100)
     parser.add_argument("--cost-weight", type=float, default=0.05)
-    parser.add_argument("--risk-beta", type=float, default=None)
+    parser.add_argument(
+        "--risk-beta",
+        type=float,
+        default=None,
+        help=f"Override risk penalty beta (paper default: {DEFAULT_RISK_BETA}).",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--latent-dim", type=int, default=16)
     parser.add_argument("--hidden-layers", type=parse_hidden_layers, default=(128,))

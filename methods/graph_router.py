@@ -1,24 +1,25 @@
 #!/usr/bin/env python3
-"""Graph-style edge-prediction router for distribution-aware LLM routing.
+"""GraphRouter edge predictor for single-shot and DARS supervision.
 
-The local disawarerouter data is organized as scored query/model observations,
-not as the original LAMDA-ORBIT dataframe. This script follows ``mlp.py`` for
-data loading, feature extraction, test splitting, and reporting, while adapting
-the GraphRouter idea: build query-model edges and predict per-edge score/cost.
+The implementation follows the DARS paper appendix: each query-model pair is
+an edge, and the router predicts edge-level score, cost, and uncertainty from
+query features and model descriptions.
 """
 
 from __future__ import annotations
 
 import argparse
+from collections.abc import Sequence
 from dataclasses import dataclass
+from itertools import pairwise
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn as nn
 from sklearn.feature_extraction.text import TfidfVectorizer
+from torch import nn
 
 try:
     from .mlp import (
@@ -26,6 +27,7 @@ try:
         DATASET_RISK_BETA,
         DATASETS,
         DEFAULT_LOCAL_ENCODER,
+        DEFAULT_RISK_BETA,
         build_quality_table,
         build_query_text_table,
         build_test_baselines,
@@ -44,6 +46,7 @@ except ImportError:
         DATASET_RISK_BETA,
         DATASETS,
         DEFAULT_LOCAL_ENCODER,
+        DEFAULT_RISK_BETA,
         build_quality_table,
         build_query_text_table,
         build_test_baselines,
@@ -108,7 +111,10 @@ class GraphTextEncoder:
         test_texts: Sequence[str],
         model_texts: Sequence[str],
     ) -> tuple[Any, Any, np.ndarray]:
-        if self.backend in {"auto", "sentence-transformer"} and self.local_encoder_path.exists():
+        if (
+            self.backend in {"auto", "sentence-transformer"}
+            and self.local_encoder_path.exists()
+        ):
             try:
                 from sentence_transformers import SentenceTransformer
             except ImportError:
@@ -124,7 +130,9 @@ class GraphTextEncoder:
                 )
 
         if self.backend == "sentence-transformer":
-            raise FileNotFoundError(f"Local sentence encoder not found: {self.local_encoder_path}")
+            raise FileNotFoundError(
+                f"Local sentence encoder not found: {self.local_encoder_path}"
+            )
 
         self._vectorizer = TfidfVectorizer(
             max_features=self.max_features,
@@ -132,7 +140,9 @@ class GraphTextEncoder:
             ngram_range=(1, 2),
         )
         self.name = "tfidf"
-        train_features = self._vectorizer.fit_transform(list(train_texts) + list(model_texts))
+        train_features = self._vectorizer.fit_transform(
+            list(train_texts) + list(model_texts)
+        )
         n_train = len(train_texts)
         x_train = train_features[:n_train]
         model_features = train_features[n_train:].toarray().astype(np.float32)
@@ -167,13 +177,15 @@ class EdgeGraphNet(nn.Module):
         edge_input_dim = model_feature_dim * 4
         layers: list[nn.Module] = []
         dims = [edge_input_dim, *[int(size) for size in hidden_layers]]
-        for in_dim, out_dim in zip(dims, dims[1:]):
+        for in_dim, out_dim in pairwise(dims):
             layers.append(nn.Linear(in_dim, out_dim))
             layers.append(nn.ReLU())
         layers.append(nn.Linear(dims[-1], output_dim))
         self.edge_mlp = nn.Sequential(*layers)
 
-    def forward(self, query_features: torch.Tensor, model_features: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, query_features: torch.Tensor, model_features: torch.Tensor
+    ) -> torch.Tensor:
         query_hidden = torch.relu(self.query_proj(query_features))
         model_hidden = torch.relu(self.model_proj(model_features))
         n_queries = int(query_hidden.shape[0])
@@ -209,14 +221,17 @@ def seed_training(seed: int) -> None:
 def get_risk_beta(dataset: str, config: GraphConfig) -> float:
     if config.risk_beta is not None:
         return float(config.risk_beta)
-    return float(DATASET_RISK_BETA.get(dataset, 0.10))
+    return float(DATASET_RISK_BETA.get(dataset, DEFAULT_RISK_BETA))
 
 
 def model_description_texts(models: Sequence[str], source: str) -> list[str]:
     if source == "name":
         return [model for model in models]
     if source == "generic":
-        return [f"{model}. {MODEL_DESCRIPTIONS.get(model, 'Large language model.')}" for model in models]
+        return [
+            f"{model}. {MODEL_DESCRIPTIONS.get(model, 'Large language model.')}"
+            for model in models
+        ]
     raise ValueError(f"Unsupported description source: {source}")
 
 
@@ -225,7 +240,9 @@ def graph_targets(
     query_meta: pd.DataFrame,
     models: Sequence[str],
 ) -> np.ndarray:
-    targets = pivot_targets(qtarget, query_meta, ["mean_score", "mean_cost", "score_std"], models)
+    targets = pivot_targets(
+        qtarget, query_meta, ["mean_score", "mean_cost", "score_std"], models
+    )
     stacked = np.stack(
         [
             np.clip(targets["mean_score"], 0.0, 1.0),
@@ -306,7 +323,9 @@ def predict_graph_router(
     device = resolve_device(config.device)
     query_features = np.asarray(to_dense_array(x_test), dtype=np.float32)
     query_tensor = torch.from_numpy(query_features).to(device)
-    model_tensor = torch.from_numpy(np.asarray(model_features, dtype=np.float32)).to(device)
+    model_tensor = torch.from_numpy(np.asarray(model_features, dtype=np.float32)).to(
+        device
+    )
 
     model.eval()
     with torch.no_grad():
@@ -336,7 +355,9 @@ def predict_graph_router(
                     "pred_cost": float(pred_cost[row_index, model_index]),
                     "pred_score_std": float(pred_std[row_index, model_index]),
                     "pred_utility": float(pred_utility[row_index, model_index]),
-                    "pred_risk_utility": float(pred_risk_utility[row_index, model_index]),
+                    "pred_risk_utility": float(
+                        pred_risk_utility[row_index, model_index]
+                    ),
                     "risk_beta": float(risk_beta),
                     "selected": bool(model_index == selected[row_index]),
                 }
@@ -454,7 +475,7 @@ def run_experiment(
                 seed=config.seed,
                 config=config,
             )
-            router_name = "graph_distribution"
+            router_name = "graph_router_distribution"
             predictions, model_predictions = predict_graph_router(
                 graph_model,
                 ds_x_test,
@@ -465,7 +486,9 @@ def run_experiment(
                 test_meta=ds_test_meta,
                 config=config,
             )
-            summary, detail = evaluate_predictions(predictions, rewrite_qtable, decoding_qtable)
+            summary, detail = evaluate_predictions(
+                predictions, rewrite_qtable, decoding_qtable
+            )
             summaries.append(
                 add_summary_metadata(
                     summary,
@@ -496,7 +519,7 @@ def run_experiment(
                     seed=config.seed + run,
                     config=config,
                 )
-                router_name = f"graph_single_point_{run:03d}"
+                router_name = f"graph_router_single_point_{run:03d}"
                 predictions, model_predictions = predict_graph_router(
                     graph_model,
                     ds_x_test,
@@ -507,7 +530,9 @@ def run_experiment(
                     test_meta=ds_test_meta,
                     config=config,
                 )
-                summary, detail = evaluate_predictions(predictions, rewrite_qtable, decoding_qtable)
+                summary, detail = evaluate_predictions(
+                    predictions, rewrite_qtable, decoding_qtable
+                )
                 summaries.append(
                     add_summary_metadata(
                         summary,
@@ -524,7 +549,9 @@ def run_experiment(
                 evaluation_frames.append(detail)
 
     if not summaries:
-        raise ValueError("No graph routers were trained. Check dataset names and input files.")
+        raise ValueError(
+            "No graph routers were trained. Check dataset names and input files."
+        )
 
     output_dir.mkdir(parents=True, exist_ok=True)
     summary_df = pd.DataFrame(summaries)
@@ -535,19 +562,19 @@ def run_experiment(
         how="left",
         validate="many_to_one",
     )
-    summary_df.to_csv(output_dir / "graphrouter_summary.csv", index=False)
+    summary_df.to_csv(output_dir / "graph_router_summary.csv", index=False)
     summarize_runs(summary_df).to_csv(
-        output_dir / "graphrouter_summary_by_mode.csv", index=False
+        output_dir / "graph_router_summary_by_mode.csv", index=False
     )
-    baselines.to_csv(output_dir / "graphrouter_test_baselines.csv", index=False)
+    baselines.to_csv(output_dir / "graph_router_test_baselines.csv", index=False)
     pd.concat(prediction_frames, ignore_index=True).to_csv(
-        output_dir / "graphrouter_predictions.csv", index=False
+        output_dir / "graph_router_predictions.csv", index=False
     )
     pd.concat(model_prediction_frames, ignore_index=True).to_csv(
-        output_dir / "graphrouter_model_predictions.csv", index=False
+        output_dir / "graph_router_model_predictions.csv", index=False
     )
     pd.concat(evaluation_frames, ignore_index=True).to_csv(
-        output_dir / "graphrouter_evaluation_detail.csv", index=False
+        output_dir / "graph_router_evaluation_detail.csv", index=False
     )
     return summary_df
 
@@ -555,7 +582,9 @@ def run_experiment(
 def parse_hidden_layers(value: str) -> tuple[int, ...]:
     layers = tuple(int(part.strip()) for part in value.split(",") if part.strip())
     if not layers or any(layer <= 0 for layer in layers):
-        raise argparse.ArgumentTypeError("hidden layers must be positive comma-separated integers")
+        raise argparse.ArgumentTypeError(
+            "hidden layers must be positive comma-separated integers"
+        )
     return layers
 
 
@@ -566,7 +595,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=project_dir / "analysis_outputs_graphrouter",
+        default=project_dir / "outputs" / "graph_router",
     )
     parser.add_argument("--datasets", nargs="+", default=list(DATASETS))
     parser.add_argument(
@@ -579,15 +608,19 @@ def parse_args() -> argparse.Namespace:
         choices=("auto", "tfidf", "sentence-transformer"),
         default="auto",
     )
-    parser.add_argument("--local-encoder-path", type=Path, default=DEFAULT_LOCAL_ENCODER)
-    parser.add_argument("--description-source", choices=("generic", "name"), default="generic")
+    parser.add_argument(
+        "--local-encoder-path", type=Path, default=DEFAULT_LOCAL_ENCODER
+    )
+    parser.add_argument(
+        "--description-source", choices=("generic", "name"), default="generic"
+    )
     parser.add_argument("--single-point-runs", type=int, default=100)
     parser.add_argument("--cost-weight", type=float, default=0.05)
     parser.add_argument(
         "--risk-beta",
         type=float,
         default=None,
-        help="Override distribution risk penalty beta. Default follows mlp.py per dataset.",
+        help=f"Override risk penalty beta (paper default: {DEFAULT_RISK_BETA}).",
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--hidden-layers", type=parse_hidden_layers, default=(256, 128))
@@ -677,7 +710,7 @@ def main() -> None:
         .sort_values("dataset_display")
         .to_string(index=False)
     )
-    print(f"\nSaved graph router outputs to {args.output_dir}")
+    print(f"\nSaved GraphRouter outputs to {args.output_dir}")
 
 
 if __name__ == "__main__":

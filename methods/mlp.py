@@ -11,9 +11,10 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -21,7 +22,6 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.neural_network import MLPRegressor
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
-
 
 DATASETS = ("gpqa", "math-500", "drop-800")
 MODEL_ORDER = (
@@ -37,14 +37,11 @@ DATASET_DISPLAY = {
     "math-500": "MATH-500",
     "drop-800": "DROP-800",
 }
-# MATH labels are more sensitive to uncertainty over-penalization in the
-# notebook experiments, so keep its default risk weight weaker.
-DATASET_RISK_BETA = {
-    "gpqa": 0.1,
-    "math-500": 0.05,
-    "drop-800": 0.15,
-}
-DEFAULT_LOCAL_ENCODER = Path("/data/laign/code/LAMDA-ORBIT/all-MiniLM-L6-v2")
+DEFAULT_RISK_BETA = 0.2
+DATASET_RISK_BETA = {dataset: DEFAULT_RISK_BETA for dataset in DATASETS}
+DEFAULT_LOCAL_ENCODER = (
+    Path(__file__).resolve().parents[1] / "models" / "all-MiniLM-L6-v2"
+)
 JSONL_FIELDS = (
     "dataset",
     "split",
@@ -66,7 +63,7 @@ JSONL_FIELDS = (
 
 @dataclass(frozen=True)
 class RouterConfig:
-    cost_weight: float = 0.0
+    cost_weight: float = 0.05
     risk_beta: float | None = None
     seed: int = 42
     single_point_runs: int = 100
@@ -91,8 +88,18 @@ def read_scored_jsonl(path: Path, dataset: str, split: str) -> pd.DataFrame:
                 raise ValueError(f"Invalid JSONL at {path}:{line_no}") from exc
 
             row = {field: record.get(field) for field in JSONL_FIELDS}
-            row["dataset"] = row["dataset"] or dataset
-            row["split"] = row["split"] or split
+            if row["dataset"] not in (None, "", dataset):
+                raise ValueError(
+                    f"Dataset mismatch at {path}:{line_no}: "
+                    f"expected {dataset!r}, found {row['dataset']!r}."
+                )
+            if row["split"] not in (None, "", split):
+                raise ValueError(
+                    f"Split mismatch at {path}:{line_no}: "
+                    f"expected {split!r}, found {row['split']!r}."
+                )
+            row["dataset"] = dataset
+            row["split"] = split
             rows.append(row)
 
     if not rows:
@@ -102,6 +109,14 @@ def read_scored_jsonl(path: Path, dataset: str, split: str) -> pd.DataFrame:
 
 def load_scored_data(data_dir: Path, datasets: Sequence[str]) -> pd.DataFrame:
     """Load train and test scored generations for each selected dataset."""
+    if not datasets:
+        raise ValueError("At least one dataset must be selected.")
+    unknown_datasets = sorted(set(datasets).difference(DATASETS))
+    if unknown_datasets:
+        raise ValueError(
+            f"Unsupported datasets: {unknown_datasets}. Expected a subset of {list(DATASETS)}."
+        )
+
     frames = []
     for dataset in datasets:
         for split in ("train", "test"):
@@ -113,14 +128,23 @@ def load_scored_data(data_dir: Path, datasets: Sequence[str]) -> pd.DataFrame:
     df = pd.concat(frames, ignore_index=True)
     df["score"] = pd.to_numeric(df["score"], errors="coerce")
     df["cost"] = pd.to_numeric(df["cost"], errors="coerce")
-    df = df.dropna(subset=["dataset", "query_id", "model", "score", "cost"]).copy()
-    if df.empty:
-        raise ValueError("No records with finite score and cost were loaded.")
+    required = ["dataset", "split", "query_id", "model", "score", "cost"]
+    valid = df[required].notna().all(axis=1)
+    valid &= np.isfinite(df["score"]) & np.isfinite(df["cost"])
+    valid &= df["cost"] >= 0
+    if not valid.all():
+        invalid_count = int((~valid).sum())
+        raise ValueError(
+            f"Found {invalid_count} scored rows with missing identifiers, non-finite values, "
+            "or negative costs."
+        )
 
     df["dataset_display"] = df["dataset"].map(DATASET_DISPLAY).fillna(df["dataset"])
-    cmin = float(df["cost"].min())
-    cmax = float(df["cost"].max())
-    df["routing_cost"] = 0.0 if cmax <= cmin else (df["cost"] - cmin) / (cmax - cmin)
+    # The paper normalizes inference cost independently within each dataset.
+    dataset_min = df.groupby("dataset")["cost"].transform("min")
+    dataset_max = df.groupby("dataset")["cost"].transform("max")
+    denominator = (dataset_max - dataset_min).replace(0.0, np.nan)
+    df["routing_cost"] = ((df["cost"] - dataset_min) / denominator).fillna(0.0)
     return df
 
 
@@ -135,13 +159,19 @@ def first_nonempty(record: dict[str, Any], keys: Iterable[str]) -> str:
 def build_query_text_table(split_df: pd.DataFrame, use_context: bool) -> pd.DataFrame:
     """Return one original-query text feature row for each dataset/query pair."""
     rows = []
-    for (dataset, query_id), group in split_df.groupby(["dataset", "query_id"], sort=False):
+    for (dataset, query_id), group in split_df.groupby(
+        ["dataset", "query_id"], sort=False
+    ):
         record = group.iloc[0].to_dict()
         question = first_nonempty(
             record, ("original_question", "input_question", "question", "prompt")
         )
         context = first_nonempty(record, ("context", "passage"))
-        text = f"{context[:1200]}\nQuestion: {question}" if use_context and context else question
+        text = (
+            f"{context[:1200]}\nQuestion: {question}"
+            if use_context and context
+            else question
+        )
         rows.append(
             {
                 "dataset": dataset,
@@ -172,6 +202,12 @@ class QueryEncoder:
         local_encoder_path: Path,
         max_features: int,
     ) -> None:
+        supported_backends = {"auto", "tfidf", "sentence-transformer"}
+        if backend not in supported_backends:
+            raise ValueError(
+                f"Unsupported feature backend {backend!r}; expected one of "
+                f"{sorted(supported_backends)}."
+            )
         self.backend = backend
         self.local_encoder_path = local_encoder_path
         self.max_features = max_features
@@ -179,8 +215,13 @@ class QueryEncoder:
         self._encoder: Any = None
         self._vectorizer: TfidfVectorizer | None = None
 
-    def fit_transform(self, train_texts: Sequence[str], test_texts: Sequence[str]) -> tuple[Any, Any]:
-        if self.backend in {"auto", "sentence-transformer"} and self.local_encoder_path.exists():
+    def fit_transform(
+        self, train_texts: Sequence[str], test_texts: Sequence[str]
+    ) -> tuple[Any, Any]:
+        if (
+            self.backend in {"auto", "sentence-transformer"}
+            and self.local_encoder_path.exists()
+        ):
             try:
                 from sentence_transformers import SentenceTransformer
             except ImportError:
@@ -192,7 +233,9 @@ class QueryEncoder:
                 return self._encode_dense(train_texts), self._encode_dense(test_texts)
 
         if self.backend == "sentence-transformer":
-            raise FileNotFoundError(f"Local sentence encoder not found: {self.local_encoder_path}")
+            raise FileNotFoundError(
+                f"Local sentence encoder not found: {self.local_encoder_path}"
+            )
 
         self._vectorizer = TfidfVectorizer(
             max_features=self.max_features,
@@ -200,7 +243,9 @@ class QueryEncoder:
             ngram_range=(1, 2),
         )
         self.name = "tfidf"
-        return self._vectorizer.fit_transform(train_texts), self._vectorizer.transform(test_texts)
+        return self._vectorizer.fit_transform(train_texts), self._vectorizer.transform(
+            test_texts
+        )
 
     def _encode_dense(self, texts: Sequence[str]) -> np.ndarray:
         return np.asarray(
@@ -237,10 +282,10 @@ def build_quality_table(records: pd.DataFrame, cost_weight: float) -> pd.DataFra
 
 
 def get_risk_beta(dataset: str, config: RouterConfig) -> float:
-    """Return an explicit beta override or the dataset-tuned default."""
+    """Return an explicit beta override or the paper's default value."""
     if config.risk_beta is not None:
         return float(config.risk_beta)
-    return float(DATASET_RISK_BETA.get(dataset, 0.10))
+    return float(DATASET_RISK_BETA.get(dataset, DEFAULT_RISK_BETA))
 
 
 def sample_single_point_quality_table(
@@ -293,7 +338,9 @@ def pivot_targets(
         for model in models:
             if model in model_means.index:
                 pivoted[model] = pivoted[model].fillna(float(model_means[model]))
-        fallback = float(qtarget[column].mean()) if qtarget[column].notna().any() else 0.0
+        fallback = (
+            float(qtarget[column].mean()) if qtarget[column].notna().any() else 0.0
+        )
         targets[column] = pivoted.fillna(fallback).to_numpy(dtype=float)
     return targets
 
@@ -340,13 +387,19 @@ def train_predict_router(
         target_columns.append("score_std")
     targets = pivot_targets(qtarget, train_meta, target_columns, models)
 
-    score_model = fit_regressor(x_train, targets["mean_score"], seed=seed, config=config)
-    cost_model = fit_regressor(x_train, targets["mean_cost"], seed=seed + 991, config=config)
+    score_model = fit_regressor(
+        x_train, targets["mean_score"], seed=seed, config=config
+    )
+    cost_model = fit_regressor(
+        x_train, targets["mean_cost"], seed=seed + 991, config=config
+    )
     predicted_score = np.clip(score_model.predict(to_dense_array(x_test)), 0.0, 1.0)
     predicted_cost = np.clip(cost_model.predict(to_dense_array(x_test)), 0.0, 1.0)
 
     if risk_aware:
-        risk_model = fit_regressor(x_train, targets["score_std"], seed=seed + 1991, config=config)
+        risk_model = fit_regressor(
+            x_train, targets["score_std"], seed=seed + 1991, config=config
+        )
         predicted_std = np.clip(risk_model.predict(to_dense_array(x_test)), 0.0, 1.0)
     else:
         predicted_std = np.zeros_like(predicted_score)
@@ -373,7 +426,9 @@ def train_predict_router(
                     "pred_cost": float(predicted_cost[row_index, model_index]),
                     "pred_score_std": float(predicted_std[row_index, model_index]),
                     "pred_utility": float(predicted_utility[row_index, model_index]),
-                    "pred_risk_utility": float(predicted_risk_utility[row_index, model_index]),
+                    "pred_risk_utility": float(
+                        predicted_risk_utility[row_index, model_index]
+                    ),
                     "risk_beta": float(risk_beta),
                 }
             )
@@ -402,9 +457,16 @@ def split_test_records(test_records: pd.DataFrame) -> tuple[pd.DataFrame, pd.Dat
         rewrite = test_records[prompt_ids >= 0].copy()
     if decoding.empty and prompt_ids.notna().any():
         decoding = test_records[prompt_ids < 0].copy()
-    return (rewrite if not rewrite.empty else test_records.copy()), (
-        decoding if not decoding.empty else test_records.copy()
-    )
+    if rewrite.empty or decoding.empty:
+        missing = []
+        if rewrite.empty:
+            missing.append("prompt_variation")
+        if decoding.empty:
+            missing.append("decoding_variation")
+        raise ValueError(
+            "Test data is missing required observation views: " + ", ".join(missing)
+        )
+    return rewrite, decoding
 
 
 def evaluate_predictions(
@@ -450,7 +512,7 @@ def evaluate_predictions(
         "decoding_cost": float(detail["decoding_cost"].mean()),
         "decoding_score_std": float(detail["decoding_score_std"].mean()),
         "decoding_observations_per_query": float(detail["decoding_n_obs"].mean()),
-        "n_eval": int(len(detail)),
+        "n_eval": len(detail),
     }
     return summary, detail
 
@@ -458,7 +520,9 @@ def evaluate_predictions(
 def score_baselines(qtable: pd.DataFrame, prefix: str) -> pd.DataFrame:
     """Return best fixed-model and per-query Oracle scores for one test view."""
     fixed_model_scores = (
-        qtable.groupby(["dataset", "dataset_display", "model"], sort=False)["mean_score"]
+        qtable.groupby(["dataset", "dataset_display", "model"], sort=False)[
+            "mean_score"
+        ]
         .mean()
         .reset_index()
     )
@@ -473,7 +537,9 @@ def score_baselines(qtable: pd.DataFrame, prefix: str) -> pd.DataFrame:
     )
 
     oracle = (
-        qtable.groupby(["dataset", "dataset_display", "query_id"], sort=False)["mean_score"]
+        qtable.groupby(["dataset", "dataset_display", "query_id"], sort=False)[
+            "mean_score"
+        ]
         .max()
         .groupby(["dataset", "dataset_display"], sort=False)
         .mean()
@@ -482,7 +548,9 @@ def score_baselines(qtable: pd.DataFrame, prefix: str) -> pd.DataFrame:
     return best_fixed.merge(oracle, on=["dataset", "dataset_display"], how="inner")
 
 
-def build_test_baselines(rewrite_qtable: pd.DataFrame, decoding_qtable: pd.DataFrame) -> pd.DataFrame:
+def build_test_baselines(
+    rewrite_qtable: pd.DataFrame, decoding_qtable: pd.DataFrame
+) -> pd.DataFrame:
     """Build score baselines for rewritten prompts and original-query decoding."""
     rewrite = score_baselines(rewrite_qtable, "rewrite")
     decoding = score_baselines(decoding_qtable, "decoding")
@@ -586,7 +654,7 @@ def run_experiment(
             continue
 
         if mode in {"distribution", "both"}:
-            router_name = "risk_aware_distribution"
+            router_name = "mlp_distribution"
             risk_beta = get_risk_beta(dataset, config)
             predictions, model_predictions = train_predict_router(
                 qtarget=train_distribution_qtable[
@@ -603,7 +671,9 @@ def run_experiment(
                 risk_beta=risk_beta,
                 router_name=router_name,
             )
-            summary, detail = evaluate_predictions(predictions, rewrite_qtable, decoding_qtable)
+            summary, detail = evaluate_predictions(
+                predictions, rewrite_qtable, decoding_qtable
+            )
             summaries.append(
                 add_summary_metadata(
                     summary,
@@ -625,7 +695,7 @@ def run_experiment(
                     seed=config.seed + run,
                     cost_weight=config.cost_weight,
                 )
-                router_name = f"single_point_{run:03d}"
+                router_name = f"mlp_single_point_{run:03d}"
                 predictions, model_predictions = train_predict_router(
                     qtarget=single_qtable,
                     train_meta=ds_train_meta,
@@ -639,7 +709,9 @@ def run_experiment(
                     risk_beta=0.0,
                     router_name=router_name,
                 )
-                summary, detail = evaluate_predictions(predictions, rewrite_qtable, decoding_qtable)
+                summary, detail = evaluate_predictions(
+                    predictions, rewrite_qtable, decoding_qtable
+                )
                 summaries.append(
                     add_summary_metadata(
                         summary,
@@ -655,7 +727,9 @@ def run_experiment(
                 evaluation_frames.append(detail)
 
     if not summaries:
-        raise ValueError("No routers were trained. Check dataset names and input files.")
+        raise ValueError(
+            "No routers were trained. Check dataset names and input files."
+        )
 
     output_dir.mkdir(parents=True, exist_ok=True)
     summary_df = pd.DataFrame(summaries)
@@ -667,7 +741,9 @@ def run_experiment(
         validate="many_to_one",
     )
     summary_df.to_csv(output_dir / "mlp_summary.csv", index=False)
-    summarize_runs(summary_df).to_csv(output_dir / "mlp_summary_by_mode.csv", index=False)
+    summarize_runs(summary_df).to_csv(
+        output_dir / "mlp_summary_by_mode.csv", index=False
+    )
     baselines.to_csv(output_dir / "mlp_test_baselines.csv", index=False)
     pd.concat(prediction_frames, ignore_index=True).to_csv(
         output_dir / "mlp_predictions.csv", index=False
@@ -684,7 +760,9 @@ def run_experiment(
 def parse_hidden_layers(value: str) -> tuple[int, ...]:
     layers = tuple(int(part.strip()) for part in value.split(",") if part.strip())
     if not layers or any(layer <= 0 for layer in layers):
-        raise argparse.ArgumentTypeError("hidden layers must be positive comma-separated integers")
+        raise argparse.ArgumentTypeError(
+            "hidden layers must be positive comma-separated integers"
+        )
     return layers
 
 
@@ -692,7 +770,9 @@ def parse_args() -> argparse.Namespace:
     project_dir = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", type=Path, default=project_dir / "data")
-    parser.add_argument("--output-dir", type=Path, default=project_dir / "analysis_outputs_mlp")
+    parser.add_argument(
+        "--output-dir", type=Path, default=project_dir / "outputs" / "mlp"
+    )
     parser.add_argument("--datasets", nargs="+", default=list(DATASETS))
     parser.add_argument(
         "--mode",
@@ -704,14 +784,16 @@ def parse_args() -> argparse.Namespace:
         choices=("auto", "tfidf", "sentence-transformer"),
         default="auto",
     )
-    parser.add_argument("--local-encoder-path", type=Path, default=DEFAULT_LOCAL_ENCODER)
+    parser.add_argument(
+        "--local-encoder-path", type=Path, default=DEFAULT_LOCAL_ENCODER
+    )
     parser.add_argument("--single-point-runs", type=int, default=100)
     parser.add_argument("--cost-weight", type=float, default=0.05)
     parser.add_argument(
         "--risk-beta",
         type=float,
         default=None,
-        help="Override risk penalty beta. Default uses 0.02 for MATH-500 and 0.10 otherwise.",
+        help=f"Override risk penalty beta (paper default: {DEFAULT_RISK_BETA}).",
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--hidden-layers", type=parse_hidden_layers, default=(128, 64))
