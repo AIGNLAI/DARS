@@ -1,0 +1,35 @@
+cff-version: 1.2.0
+message: "If you use DARS or its benchmark, please cite the accompanying paper."
+title: "DARS: Distribution-Aware Routing Supervision"
+type: software
+license: MIT
+repository-code: "https://github.com/AIGNLAI/DARS"
+url: "https://aignlai.github.io/DARS/"
+authors:
+  - family-names: Lai
+    given-names: Guannan
+  - family-names: Hu
+    given-names: Haoran
+  - family-names: Chen
+    given-names: Long
+  - family-names: Li
+    given-names: Zhenguo
+  - family-names: Ye
+    given-names: Han-Jia
+preferred-citation:
+  type: conference-paper
+  title: "From Sampled Outcomes to Capability Distributions: Rethinking Supervision for LLM Routing"
+  authors:
+    - family-names: Lai
+      given-names: Guannan
+    - family-names: Hu
+      given-names: Haoran
+    - family-names: Chen
+      given-names: Long
+    - family-names: Li
+      given-names: Zhenguo
+    - family-names: Ye
+      given-names: Han-Jia
+  collection-title: "Proceedings of the 2026 Conference on Empirical Methods in Natural Language Processing"
+  year: 2026
+  url: "https://arxiv.org/abs/2606.06924"

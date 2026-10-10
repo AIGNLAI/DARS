@@ -6,7 +6,7 @@
 
 Guannan Lai · Haoran Hu · Long Chen · Zhenguo Li · Han-Jia Ye
 
-**Accepted at EMNLP 2026**
+**EMNLP 2026 · Main Conference**
 
 [![EMNLP 2026](https://img.shields.io/badge/EMNLP-2026-4b44ce.svg)](https://2026.emnlp.org/)
 [![Paper](https://img.shields.io/badge/arXiv-2606.06924-b31b1b.svg)](https://arxiv.org/abs/2606.06924)
@@ -15,7 +15,9 @@ Guannan Lai · Haoran Hu · Long Chen · Zhenguo Li · Han-Jia Ye
 
 Official implementation and data for **DARS (Distribution-Aware Routing Supervision)**.
 
-[Quick Start](#quick-start) · [Reproduce Experiments](#reproduce-the-routing-experiments) · [Build from Raw Data](#build-the-data-from-scratch) · [Citation](#citation)
+**[Project Page](https://aignlai.github.io/DARS/) · [Paper](https://arxiv.org/abs/2606.06924) · [PDF](https://arxiv.org/pdf/2606.06924) · [Dataset](https://huggingface.co/datasets/AIGNLAI/DARS)**
+
+[Key Results](#key-results) · [Quick Start](#quick-start) · [Reproduce Experiments](#reproduce-the-routing-experiments) · [Build from Raw Data](#build-the-data-from-scratch) · [Citation](#citation)
 
 </div>
 
@@ -29,24 +31,32 @@ Most LLM routers learn from a single sampled answer for every query–model pair
 
 </div>
 
-DARS changes the supervision—not the router architecture—so it can be applied to regression-, retrieval-, graph-, clustering-, representation-, causal-, and IRT-based routers.
+DARS supplies supervision to existing routers, including regression, classification, retrieval, graph, clustering, representation-learning, and IRT methods. Repeated sampling happens during **offline supervision construction**; at inference, the trained router selects a model from the original query.
 
-```mermaid
-flowchart LR
-    A[Original query] --> B[5 semantic rewrites]
-    B --> C[5 stochastic decodes<br/>per model and rewrite]
-    C --> D[Capability distribution]
-    D --> E[Expected quality μq]
-    D --> F[Expected cost μc]
-    D --> G[Performance risk σq]
-    E --> H[Risk-aware routing supervision]
-    F --> H
-    G --> H
-```
+![DARS framework: query rewrites and repeated decoding estimate expected quality, expected cost, and performance variability for risk-aware routing supervision.](assets/framework.png)
+
+*Figure 3 from the [paper](https://arxiv.org/html/2606.06924v2#S4.F3).*
+
+## Key Results
+
+- **40 / 42 improvements:** DARS improves routing utility across 7 routers × 3 tasks × 2 evaluation views in Table 1.
+- **Supervision is unstable:** GPQA's diagnostic winner flip rate is **97.0%** under repeated single-shot observations (Section 3.3).
+- **Moderate sampling works:** the **3 × 3** observation protocol performs close to the full **5 × 5** protocol in Figure 4(a).
+
+Selected results for the MIRT router, from **Table 1** of the paper:
+
+| Dataset | Rewrite utility: single-shot → DARS | Decoding utility: single-shot → DARS |
+|:--|:--:|:--:|
+| GPQA | 0.409 → **0.444** | 0.433 → **0.468** |
+| MATH-500 | 0.697 → **0.759** | 0.714 → **0.760** |
+| DROP-800 | 0.687 → **0.705** | 0.734 → **0.751** |
+
+Utilities use `λ = 0.05`; higher is better. Single-shot results average 100 independently sampled training sets. These are **reported paper results**. See the [complete results and protocol](docs/RESULTS.md), [machine-readable Table 1](docs/paper_results.csv), and [interactive project page](https://aignlai.github.io/DARS/#results) for all routers, including the two settings where utility decreases.
 
 ## News
 
-- **2026:** DARS was accepted at **EMNLP 2026**. 🎉
+- **2026:** DARS was accepted to the **EMNLP 2026 Main Conference**. 🎉
+- **2026-09-04:** The revised paper ([arXiv v2](https://arxiv.org/abs/2606.06924v2)) is available.
 - **2026-06:** The paper, code, and scored routing benchmark were released.
 
 ## Quick Start
@@ -79,6 +89,7 @@ Equivalent Hugging Face CLI command:
 ```bash
 hf download AIGNLAI/DARS \
   --repo-type dataset \
+  --include 'gpqa/*.json*' 'math-500/*.json*' 'drop-800/*.json*' \
   --local-dir data
 ```
 
@@ -103,6 +114,8 @@ The hosted benchmark contains 600 training queries and 1,148 held-out test queri
 | GPQA | Graduate-level science QA | 200 / 30,000 | 248 / 8,928 |
 | MATH-500 | Mathematical reasoning | 200 / 30,000 | 300 / 10,800 |
 | DROP-800 | Discrete reasoning over text | 200 / 30,000 | 600 / 21,600 |
+
+For dataset exploration, use `load_dataset("AIGNLAI/DARS", "gpqa")` (also `math-500` and `drop-800`). The three task configurations preserve their distinct answer schemas. See the [dataset card](https://huggingface.co/datasets/AIGNLAI/DARS) for fields, scoring, costs, and loading examples. For archival experiments, pin a Hugging Face commit with the downloader's `--revision` option.
 
 ### 3. Run an experiment
 
@@ -190,6 +203,8 @@ python methods/mlp.py \
   --local-encoder-path models/all-MiniLM-L6-v2 \
   --output-dir outputs/mlp_minilm
 ```
+
+The commands above reproduce the released pipeline. To compare exact paper numbers, match the encoder, router hyperparameters, seeds, and observation settings described in [Appendix C.1](https://arxiv.org/html/2606.06924v2#A3.SS1). Changing the feature backend can change the results; the TF-IDF smoke run is a functionality check.
 
 ### Experimental protocol
 
@@ -302,9 +317,12 @@ If DARS helps your work, please cite:
   title     = {From Sampled Outcomes to Capability Distributions: Rethinking Supervision for {LLM} Routing},
   author    = {Lai, Guannan and Hu, Haoran and Chen, Long and Li, Zhenguo and Ye, Han-Jia},
   booktitle = {Proceedings of the 2026 Conference on Empirical Methods in Natural Language Processing},
-  year      = {2026}
+  year      = {2026},
+  url       = {https://arxiv.org/abs/2606.06924}
 }
 ```
+
+The paper is accepted to EMNLP 2026 Main. The link above points to the arXiv version; see [CITATION.cff](CITATION.cff) for machine-readable citation metadata.
 
 ## License
 
